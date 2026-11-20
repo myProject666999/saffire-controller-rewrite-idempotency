@@ -17,11 +17,13 @@ package controllers
 import (
 	"fmt"
 	"strings"
-
-	"github.com/thoas/go-funk"
 )
 
-// parseImageString returns the repository and version of the image string
+// parseImageString returns the repository and version of the image string.
+// It only handles plain "repository:tag" forms. Digest-pinned images
+// (repo@sha256:...), implicit :latest images and registry hosts with ports
+// are not split here and return an error; callers treat that as undecidable
+// and leave the container untouched.
 func parseImageString(image string) (string, string, error) {
 	parsed := strings.Split(image, ":")
 	if len(parsed) != 2 {
@@ -38,7 +40,7 @@ func getNewImage(image string, equivalentRepositories []string) (string, error) 
 		return "", err
 	}
 
-	if !funk.ContainsString(equivalentRepositories, oldRepository) {
+	if !containsString(equivalentRepositories, oldRepository) {
 		return "", fmt.Errorf("image repository was not found in equivalentRepositories")
 	}
 
@@ -48,4 +50,14 @@ func getNewImage(image string, equivalentRepositories []string) (string, error) 
 		}
 	}
 	return "", fmt.Errorf("unable to find next repository to use")
+}
+
+// containsString reports whether the slice contains the given string.
+func containsString(slice []string, value string) bool {
+	for _, item := range slice {
+		if item == value {
+			return true
+		}
+	}
+	return false
 }

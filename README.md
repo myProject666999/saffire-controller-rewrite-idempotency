@@ -50,7 +50,7 @@ spec:
 
 This indicates that `quay.io/fairwinds/docker-demo` and `ehazlett/docker-demo` have the exact same image tags in both.
 
-Once the controller and this `AlternateImageSource` are installed in your cluster, if any pod experiences an `ImgagePullError` in that namespace and the image matches one of these repositories, saffire will find the top level controller of that pod and patch it to set the image as one of the other repositories in the `equivalentRepositories` field (currently this only applies to deployments).
+Once the controller and this `AlternateImageSource` are installed in your cluster, if any pod experiences an `ImgagePullError` in that namespace and the image matches one of these repositories, saffire will find the top level controller of that pod and patch its pod template to set the image as one of the other repositories in the `equivalentRepositories` field. Deployments, StatefulSets, DaemonSets and CronJobs are patched on their pod template (Jobs are immutable and reported as skipped instead), while pods without a controller owner are patched directly. Writes are strategic-merge patches limited to the changed container image fields, and a reconcile that has nothing to change performs no API writes at all. See [DESIGN.md](DESIGN.md) for the full behavior, including per-container decisions and thrashing detection.
 
 ## Notice: Registry Migration and Immutable Images (v0.0.29 → v0.1.0)
 

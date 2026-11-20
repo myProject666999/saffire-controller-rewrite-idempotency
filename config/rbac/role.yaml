@@ -9,11 +9,25 @@ rules:
 - apiGroups:
   - apps
   resources:
+  - daemonsets
   - deployments
+  - replicasets
+  - statefulsets
   verbs:
   - get
   - list
-  - update
+  - watch
+  - patch
+- apiGroups:
+  - batch
+  resources:
+  - cronjobs
+  - jobs
+  verbs:
+  - get
+  - list
+  - watch
+  - patch
 - apiGroups:
   - ""
   resources:
@@ -22,6 +36,7 @@ rules:
   - get
   - list
   - watch
+  - patch
 - apiGroups:
   - saffire.fairwinds.com
   resources:

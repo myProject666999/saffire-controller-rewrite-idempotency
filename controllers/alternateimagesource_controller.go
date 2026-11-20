@@ -18,118 +18,340 @@ package controllers
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"strings"
+	"sort"
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/pkg/errors"
-	"github.com/thoas/go-funk"
-	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/dynamic"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
-	"github.com/fairwindsops/controller-utils/pkg/controller"
 	saffirev1alpha1 "github.com/fairwindsops/saffire/api/v1alpha1"
 )
 
-// AlternateImageSourceReconciler reconciles a AlternateImageSource object
+// AlternateImageSourceReconciler rewrites pod template images on top-level
+// workload controllers when pods experience image pull failures.
 type AlternateImageSourceReconciler struct {
 	client.Client
-	Log              logr.Logger
-	Scheme           *runtime.Scheme
-	RestMapper       meta.RESTMapper
-	DynamicClient    dynamic.Interface
-	ControllerClient controller.Client
-}
+	Log    logr.Logger
+	Scheme *runtime.Scheme
 
-type ControllerUtilsClientInstance struct {
-	Client controller.Client
+	// thrash holds per-target patch attempts used to detect an external actor
+	// reverting our writes. It is lazily initialized and rehydrated from AIS
+	// status on the first reconcile so process restarts do not reset detection.
+	thrash *thrashTracker
+	// nowFunc is injectable for deterministic time-window tests.
+	nowFunc func() time.Time
 }
 
 // +kubebuilder:rbac:groups=saffire.fairwinds.com,resources=alternateimagesources,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=saffire.fairwinds.com,resources=alternateimagesources/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;watch;list
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;update
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;watch;list;patch
+// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets;daemonsets;replicasets,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=batch,resources=jobs;cronjobs,verbs=get;list;watch;patch
 
-// Reconcile loads and reconciles the AlternateImageSource
+// Reconcile evaluates the AlternateImageSource against pods currently failing
+// to pull images in its namespace, and rewrites the owning workload's pod
+// template when an equivalent repository is available.
 func (r *AlternateImageSourceReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	log := r.Log.WithValues("alternateimagesource", req.NamespacedName)
 
-	var alternateImageSource saffirev1alpha1.AlternateImageSource
-	if err := r.Get(ctx, req.NamespacedName, &alternateImageSource); err != nil {
+	r.ensureTracker()
+
+	var ais saffirev1alpha1.AlternateImageSource
+	if err := r.Get(ctx, req.NamespacedName, &ais); err != nil {
+		if apierrors.IsNotFound(err) {
+			return reconcile.Result{}, nil
+		}
 		log.Error(err, "unable to fetch AlternateImageSource")
-		return reconcile.Result{}, client.IgnoreNotFound(err)
+		return reconcile.Result{}, err
 	}
 
-	alternateImageSource.Status.ObservedGeneration = alternateImageSource.ObjectMeta.Generation
-	alternateImageSource.Status.Switches = pruneSwitchStatus(alternateImageSource.Status.Switches)
+	// Restore thrash windows from status without clobbering live in-memory state.
+	r.thrash.rehydrate(ais.Status.Results)
 
-	for _, replacement := range alternateImageSource.Spec.ImageSourceReplacements {
-		newSwitchStatus, err := r.needsActivation(req.Namespace, replacement.EquivalentRepositories)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if newSwitchStatus == nil {
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(req.Namespace)); err != nil {
+		log.Error(err, "unable to list pods")
+		return reconcile.Result{}, err
+	}
+
+	badRepositories := map[string]bool{}
+	var failingPods []corev1.Pod
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !r.podHasImagePullErr(pod) {
 			continue
 		}
-
-		if alternateImageSource.Status.Switches != nil {
-			if !r.shouldSwitch(alternateImageSource.Status.Switches, *newSwitchStatus) {
-				return ctrl.Result{}, nil
-			}
-		}
-
-		err = r.switchImage(newSwitchStatus, req.Namespace)
-		if err != nil {
-			log.Error(err, "unable to update target")
-		}
-		alternateImageSource.Status.Switches = append(alternateImageSource.Status.Switches, *newSwitchStatus)
+		failingPods = append(failingPods, *pod)
+		collectBadRepositories(pod, badRepositories)
 	}
 
-	if err := r.Status().Update(ctx, &alternateImageSource); err != nil {
+	// Results are keyed by target and carried across reconciles: once a target
+	// has been rewritten its audit history (patch time, attempts, rollout
+	// snapshot) remains stable even when later reconciles only observe that it
+	// has converged. This keeps a repeat reconcile a true no-op at the API.
+	priorByKey := map[targetKey]saffirev1alpha1.TargetResult{}
+	var priorOrder []targetKey
+	for _, prior := range ais.Status.Results {
+		key := keyFor(prior.Target)
+		if _, seen := priorByKey[key]; !seen {
+			priorOrder = append(priorOrder, key)
+		}
+		priorByKey[key] = prior
+	}
+	resultsByKey := map[targetKey]saffirev1alpha1.TargetResult{}
+	var resultOrder []targetKey
+
+	if len(failingPods) > 0 {
+		targets, err := r.collectTargets(ctx, failingPods)
+		if err != nil {
+			log.Error(err, "unable to resolve pod owners")
+			return reconcile.Result{}, err
+		}
+		for _, entry := range targets {
+			key := keyFor(targetRefFor(entry.obj, entry.gvk))
+			prior := priorByKey[key]
+			result := r.handleTarget(ctx, log, &ais, entry, badRepositories, prior)
+			resultsByKey[key] = result
+			resultOrder = append(resultOrder, key)
+		}
+	}
+
+	// Preserve results for targets no longer failing this round, in their
+	// previous order, so historical audit entries are never silently dropped.
+	for _, key := range priorOrder {
+		if _, seen := resultsByKey[key]; !seen {
+			resultsByKey[key] = priorByKey[key]
+			resultOrder = append(resultOrder, key)
+		}
+	}
+	var results []saffirev1alpha1.TargetResult
+	for _, key := range resultOrder {
+		results = append(results, resultsByKey[key])
+	}
+
+	newStatus := saffirev1alpha1.AlternateImageSourceStatus{
+		ObservedGeneration: ais.ObjectMeta.Generation,
+		Results:            results,
+	}
+	if err := r.updateStatusIfChanged(ctx, req.NamespacedName, newStatus); err != nil {
 		log.Error(err, "unable to update AlternateImageSource status")
-		return ctrl.Result{}, err
+		return reconcile.Result{}, err
 	}
 
 	return ctrl.Result{}, nil
 }
 
-// PodToAlternateImageSource is a handler.ToRequestsFunc to be used to enqueue requests to reconcile Pods
-// When a pod has an imagePullErr, this will request a reconciliation
-func (r *AlternateImageSourceReconciler) PodToAlternateImageSource(o client.Object) []ctrl.Request {
-	result := []ctrl.Request{}
-	ctx := context.Background()
+// resolvedTarget pairs an object with its own GVK.
+type resolvedTarget struct {
+	obj client.Object
+	gvk schema.GroupVersionKind
+}
 
-	p, ok := o.(*corev1.Pod)
+// collectTargets resolves the top controller of every failing pod and
+// de-duplicates them by their TargetRef. A pod owned by a controller is never
+// returned as its own target; only standalone pods are.
+func (r *AlternateImageSourceReconciler) collectTargets(ctx context.Context, failingPods []corev1.Pod) ([]resolvedTarget, error) {
+	byKey := map[targetKey]resolvedTarget{}
+	keys := []targetKey{}
+	for i := range failingPods {
+		pod := &failingPods[i]
+		top, gvk, err := r.resolveTop(ctx, pod)
+		if err != nil {
+			// A NotFound owner may be transiently absent; return to requeue.
+			return nil, err
+		}
+		ref := targetRefFor(top, gvk)
+		key := keyFor(ref)
+		if _, seen := byKey[key]; !seen {
+			byKey[key] = resolvedTarget{obj: top, gvk: gvk}
+			keys = append(keys, key)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		a, b := keys[i], keys[j]
+		if a.kind != b.kind {
+			return a.kind < b.kind
+		}
+		if a.namespace != b.namespace {
+			return a.namespace < b.namespace
+		}
+		return a.name < b.name
+	})
+	out := make([]resolvedTarget, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, byKey[key])
+	}
+	return out, nil
+}
+
+// handleTarget evaluates one top-level object and patches it when appropriate.
+// The decision is always based on the object's pod template, never on the
+// images of individual pods, so mixed old/new pods during a rollout cannot
+// cause a repeated rewrite.
+func (r *AlternateImageSourceReconciler) handleTarget(
+	ctx context.Context,
+	log logr.Logger,
+	ais *saffirev1alpha1.AlternateImageSource,
+	target resolvedTarget,
+	badRepositories map[string]bool,
+	prior saffirev1alpha1.TargetResult,
+) saffirev1alpha1.TargetResult {
+	ref := targetRefFor(target.obj, target.gvk)
+	key := keyFor(ref)
+	result := saffirev1alpha1.TargetResult{Target: ref}
+
+	podSpec, ok := podSpecOf(target.obj)
 	if !ok {
-		r.Log.Error(errors.Errorf("expected a Pod but got a %T", o.GetObjectKind()), "failed to get AlternateImageSource for Pod")
+		return mergePrior(prior, saffirev1alpha1.TargetResult{
+			Target: ref,
+			Phase:  saffirev1alpha1.PhaseSkipped,
+			Reason: saffirev1alpha1.ReasonUnsupportedKind,
+		})
 	}
 
-	pod := &corev1.Pod{}
-	err := r.Get(ctx, client.ObjectKey{Name: p.Name, Namespace: p.Namespace}, pod)
-	if err != nil {
-		return nil
+	decisions, rewrites := evaluateContainers(podSpec, ais.Spec.ImageSourceReplacements, badRepositories)
+	result.Containers = decisions
+
+	if _, isJob := target.obj.(*batchv1.Job); isJob {
+		// A Job's pod template is immutable once created; never attempt it.
+		result.Phase = saffirev1alpha1.PhaseSkipped
+		result.Reason = saffirev1alpha1.ReasonImmutableTemplate
+		return mergePrior(prior, result)
 	}
 
-	if r.podHasImagePullErr(pod) {
-		result = r.requestAISInNamespace(p.Namespace)
+	if !isRewritableTopLevelKind(target.gvk.Kind) {
+		result.Phase = saffirev1alpha1.PhaseSkipped
+		result.Reason = saffirev1alpha1.ReasonUnsupportedKind
+		return mergePrior(prior, result)
 	}
 
+	if len(rewrites) == 0 {
+		// The template already holds the desired image (or nothing matches).
+		// Keep the previous audit record intact so converged reconciles do not
+		// rewrite status; a target we have never seen is reported as skipped.
+		if prior.Target.Name != "" {
+			return prior
+		}
+		result.Phase = saffirev1alpha1.PhaseSkipped
+		result.Reason = saffirev1alpha1.ReasonAlreadyConverged
+		return result
+	}
+
+	if r.thrash.shouldThrottle(key) {
+		// Continue reporting the throttled state but preserve the patch history.
+		result.Phase = saffirev1alpha1.PhaseThrashing
+		result.Reason = saffirev1alpha1.ReasonThrottled
+		result.PatchAttempts = toMetav1Times(r.thrash.attemptsLockedView(key))
+		result.Rollout = rolloutOf(target.obj)
+		return mergePrior(prior, result)
+	}
+
+	base := target.obj.DeepCopyObject().(client.Object)
+	applyRewrites(podSpec, rewrites)
+
+	if err := r.strategicPatch(ctx, target.obj, base); err != nil {
+		log.Error(err, "unable to patch target", "kind", target.gvk.Kind, "name", target.obj.GetName())
+		result.Phase = saffirev1alpha1.PhaseError
+		result.Reason = err.Error()
+		return mergePrior(prior, result)
+	}
+
+	attempts := r.thrash.recordAttempt(key)
+	now := metav1.NewTime(r.now().UTC())
+	result.LastPatchTime = &now
+	result.PatchAttempts = toMetav1Times(attempts)
+	result.Rollout = rolloutOf(target.obj)
+	if len(attempts) >= thrashThreshold {
+		// The write itself happened; flag that further writes are now suppressed
+		// and an external actor appears to be reverting us.
+		result.Phase = saffirev1alpha1.PhaseThrashing
+		result.Reason = saffirev1alpha1.ReasonThrashing
+	} else {
+		result.Phase = saffirev1alpha1.PhaseTemplatePatched
+	}
 	return result
 }
 
-// SetupWithManager sets up the reconciler
+// mergePrior overlays a freshly computed result on top of the previous audit
+// record, keeping historical patch time and attempts when the new result did
+// not perform a write.
+func mergePrior(prior, fresh saffirev1alpha1.TargetResult) saffirev1alpha1.TargetResult {
+	if prior.Target.Name == "" {
+		return fresh
+	}
+	merged := fresh
+	if merged.LastPatchTime == nil {
+		merged.LastPatchTime = prior.LastPatchTime
+	}
+	if len(merged.PatchAttempts) == 0 {
+		merged.PatchAttempts = prior.PatchAttempts
+	}
+	return merged
+}
+
+// ensureTracker lazily builds the thrash tracker and clock so callers that
+// construct the reconciler without test doubles still get a working default.
+func (r *AlternateImageSourceReconciler) ensureTracker() {
+	if r.nowFunc == nil {
+		r.nowFunc = time.Now
+	}
+	if r.thrash == nil {
+		r.thrash = newThrashTracker(r.nowFunc)
+	}
+}
+
+func (r *AlternateImageSourceReconciler) now() time.Time {
+	r.ensureTracker()
+	return r.nowFunc()
+}
+
+// collectBadRepositories extracts the repositories referenced by containers
+// currently in an image pull failure state.
+func collectBadRepositories(pod *corev1.Pod, into map[string]bool) {
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.State.Waiting == nil {
+			continue
+		}
+		if status.State.Waiting.Reason != "ErrImagePull" && status.State.Waiting.Reason != "ImagePullBackOff" {
+			continue
+		}
+		// Map the status name back to the spec container to get its image.
+		for _, container := range pod.Spec.Containers {
+			if container.Name != status.Name {
+				continue
+			}
+			if repository, _, err := parseImageString(container.Image); err == nil {
+				into[repository] = true
+			}
+		}
+	}
+}
+
+// PodToAlternateImageSource enqueues the AIS objects of a namespace when a pod
+// in it experiences an image pull error.
+func (r *AlternateImageSourceReconciler) PodToAlternateImageSource(o client.Object) []ctrl.Request {
+	pod, ok := o.(*corev1.Pod)
+	if !ok {
+		r.Log.Error(nil, "expected a Pod", "got", o.GetObjectKind().GroupVersionKind())
+		return nil
+	}
+	if !r.podHasImagePullErr(pod) {
+		return nil
+	}
+	return r.requestAISInNamespace(pod.Namespace)
+}
+
+// SetupWithManager sets up the reconciler.
 func (r *AlternateImageSourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&saffirev1alpha1.AlternateImageSource{}).
@@ -140,6 +362,7 @@ func (r *AlternateImageSourceReconciler) SetupWithManager(mgr ctrl.Manager) erro
 		Complete(r)
 }
 
+// podHasImagePullErr reports whether any container is blocked on an image pull.
 func (r *AlternateImageSourceReconciler) podHasImagePullErr(pod *corev1.Pod) bool {
 	for _, status := range pod.Status.ContainerStatuses {
 		if status.State.Waiting == nil {
@@ -152,213 +375,17 @@ func (r *AlternateImageSourceReconciler) podHasImagePullErr(pod *corev1.Pod) boo
 	return false
 }
 
-// requestAISInNamespace requests reconciliation of any AlternateImageSources in a namespace
+// requestAISInNamespace requests reconciliation of any AlternateImageSources in a namespace.
 func (r *AlternateImageSourceReconciler) requestAISInNamespace(namespace string) []ctrl.Request {
 	log := r.Log.WithValues("requestAISInNamespace", namespace)
-	alternateImageSourcesInNamespace := saffirev1alpha1.AlternateImageSourceList{}
+	var list saffirev1alpha1.AlternateImageSourceList
 	result := []ctrl.Request{}
-	err := r.List(context.Background(), &alternateImageSourcesInNamespace, client.InNamespace(namespace))
-	if err != nil {
+	if err := r.List(context.Background(), &list, client.InNamespace(namespace)); err != nil {
 		log.Error(err, "error getting AlternateImageSources in namespace")
 		return nil
 	}
-	for _, ais := range alternateImageSourcesInNamespace.Items {
-		name := client.ObjectKey{Namespace: ais.Namespace, Name: ais.Name}
-		result = append(result, ctrl.Request{NamespacedName: name})
+	for _, ais := range list.Items {
+		result = append(result, ctrl.Request{NamespacedName: client.ObjectKey{Namespace: ais.Namespace, Name: ais.Name}})
 	}
 	return result
-}
-
-// needsActivation finds the first pod and container in a namespace and returns them if they have an equivalent repository
-// and if they have image pull issues. Also returns the new image string
-func (r *AlternateImageSourceReconciler) needsActivation(namespace string, equivalentRepositories []string) (*saffirev1alpha1.SwitchStatus, error) {
-	log := r.Log.WithValues("needsActivation", namespace)
-	var podsInNamespace corev1.PodList
-	if err := r.List(context.Background(), &podsInNamespace, client.InNamespace(namespace)); err != nil {
-		return nil, err
-	}
-
-	for _, pod := range podsInNamespace.Items {
-		if r.podHasImagePullErr(&pod) {
-			log.Info("pod has image pull errors - checking for equivalentRepository")
-			for _, container := range pod.Spec.Containers {
-				repositoryName, _, err := parseImageString(container.Image)
-				if err != nil {
-					log.Error(err, "could not parse image string")
-					continue
-				}
-				if funk.ContainsString(equivalentRepositories, repositoryName) {
-					log.Info(fmt.Sprintf("container %s has equivalentRepositories for image %s", container.Name, container.Image))
-					newImageString, err := getNewImage(container.Image, equivalentRepositories)
-					if err != nil {
-						return nil, err
-					}
-
-					controller := r.getPodController(&pod)
-
-					switchStatus := &saffirev1alpha1.SwitchStatus{
-						Time: v1.Now(),
-						Target: saffirev1alpha1.Target{
-							Name:      controller.GetName(),
-							Container: container.Name,
-							Type: v1.GroupKind{
-								Kind:  controller.GetKind(),
-								Group: controller.GetAPIVersion(),
-							},
-						},
-						OldImage: container.Image,
-						NewImage: newImageString,
-					}
-
-					return switchStatus, nil
-				}
-			}
-		}
-	}
-	return nil, nil
-}
-
-// getPodController determines the top-level controller of a pod
-func (r *AlternateImageSourceReconciler) getPodController(pod *corev1.Pod) *unstructured.Unstructured {
-	log := r.Log.WithValues("getPodController", pod.Name)
-
-	cache := make(map[string]unstructured.Unstructured)
-
-	podData, err := json.Marshal(pod)
-	if err != nil {
-		log.Error(err, "unable to marshal pod")
-		return nil
-	}
-
-	placeholder := make(map[string]interface{})
-	err = json.Unmarshal(podData, &placeholder)
-	if err != nil {
-		log.Error(err, "could not unmarshal pod")
-		return nil
-	}
-
-	unstructuredPod := unstructured.Unstructured{
-		Object: placeholder,
-	}
-
-	controller, err := r.ControllerClient.GetTopController(unstructuredPod, cache)
-	if err != nil {
-		log.Error(err, "could not get top controller")
-		return nil
-	}
-	log.Info("found controller", "kind", controller.GetKind(), "name", controller.GetName())
-	return &controller
-}
-
-// switch image executes the switch for different controller types
-func (r *AlternateImageSourceReconciler) switchImage(switchStatus *saffirev1alpha1.SwitchStatus, namespace string) error {
-	ctx := context.Background()
-
-	switch strings.ToLower(switchStatus.Target.Type.Kind) {
-	case "deployment":
-		deployment := &appsv1.Deployment{}
-		err := r.Get(ctx, client.ObjectKey{Name: switchStatus.Target.Name, Namespace: namespace}, deployment)
-		if err != nil {
-			return err
-		}
-
-		for _, container := range deployment.Spec.Template.Spec.Containers {
-			if container.Name == switchStatus.Target.Container {
-
-				r.Log.Info("switching", "old", switchStatus.OldImage, "new", switchStatus.NewImage)
-				err = r.updateDeployment(deployment, switchStatus.OldImage, switchStatus.NewImage)
-				if err != nil {
-					r.Log.Error(err, "")
-					continue
-				}
-			}
-		}
-	default:
-		r.Log.Info("controller type not implemented yet", "type", switchStatus.Target.Type.Kind)
-	}
-
-	return nil
-}
-
-// shouldSwitch determines if a switch is possible within time constraints
-// This prevents switching back too fast, or switching too fast in general
-func (r *AlternateImageSourceReconciler) shouldSwitch(oldSwitchStatuses []saffirev1alpha1.SwitchStatus, newSwitchStatus saffirev1alpha1.SwitchStatus) bool {
-	//TODO: Implement a backoff instead of a strict time.
-	delaySeconds := 60 * time.Second
-	var latestSwitchStatus saffirev1alpha1.SwitchStatus
-	now := v1.Now()
-	for idx, switchStatus := range oldSwitchStatuses {
-		if newSwitchStatus.Target.Name != switchStatus.Target.Name {
-			if newSwitchStatus.Target.Type.Kind != switchStatus.Target.Type.Kind {
-				// Not the same target, so we don't need to check it
-				continue
-			}
-		}
-		// Find the latest switch that happened so we can make sure we aren't going too fast
-		if idx == 0 {
-			latestSwitchStatus = switchStatus
-		} else {
-			if latestSwitchStatus.Time.Sub(switchStatus.Time.Time) < 0 {
-				latestSwitchStatus = switchStatus
-			}
-		}
-
-		// We should not switch images back within the delaySeconds time
-		// This may not be necessary. We might just keep it to the delaySeconds
-		// no matter which images we are switching to/from
-		if switchStatus.NewImage == newSwitchStatus.OldImage {
-			if switchStatus.OldImage == newSwitchStatus.NewImage {
-				diff := now.Sub(switchStatus.Time.Time)
-				if diff > delaySeconds {
-					r.Log.Info("switch back detected in too short of a time")
-					return false
-				}
-			}
-		}
-	}
-	// Switch is happening too fast.
-	if now.Sub(latestSwitchStatus.Time.Time) < delaySeconds {
-		r.Log.Info("switch happening too quickly")
-		return false
-	}
-
-	return true
-}
-
-func pruneSwitchStatus(statuses []saffirev1alpha1.SwitchStatus) []saffirev1alpha1.SwitchStatus {
-	now := v1.Now()
-	var returnList []saffirev1alpha1.SwitchStatus
-	count := 0
-	for _, status := range statuses {
-		age := now.Sub(status.Time.Time)
-		if age < (time.Minute * 30) {
-			returnList = append(returnList, status)
-			count++
-			if count >= 100 {
-				return returnList
-			}
-		}
-	}
-	return returnList
-}
-
-func (r *AlternateImageSourceReconciler) updateDeployment(deployment *appsv1.Deployment, old string, new string) error {
-	replacedAny := false
-	for idx, container := range deployment.Spec.Template.Spec.Containers {
-		existingImage := container.Image
-		if strings.Contains(existingImage, old) {
-			newImage := strings.Replace(existingImage, old, new, 1)
-			deployment.Spec.Template.Spec.Containers[idx].Image = newImage
-			replacedAny = true
-		}
-	}
-
-	if replacedAny {
-		ctx := context.Background()
-		err := r.Update(ctx, deployment)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
 }

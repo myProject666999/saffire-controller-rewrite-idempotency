@@ -63,56 +63,126 @@ spec:
                   the object
                 format: int64
                 type: integer
-              switches:
-                description: Switches is each occurence of an image switch
+              results:
+                description: Results holds one audit entry per top-level controller
+                  object evaluated.
                 items:
-                  description: SwitchStatus is a switch event
+                  description: TargetResult is the audit record for a single top-level
+                    controller object. Audit data lives on the AlternateImageSource
+                    status, never inside the workload's pod template, so recording
+                    an audit never triggers a rollout.
                   properties:
-                    newImage:
+                    containers:
+                      description: Containers holds one decision per container in
+                        the pod template.
+                      items:
+                        description: ContainerDecision records the per-container outcome
+                          of an evaluation.
+                        properties:
+                          decision:
+                            description: Decision is what the controller did (or decided
+                              not to do) with this container.
+                            type: string
+                          name:
+                            description: Name is the name of the container inside the
+                              pod template.
+                            type: string
+                          newImage:
+                            description: NewImage is the image written to the template,
+                              when Decision is Rewritten.
+                            type: string
+                          oldImage:
+                            description: OldImage is the image found in the template
+                              before rewriting.
+                            type: string
+                          reason:
+                            description: Reason optionally explains why the decision
+                              was taken.
+                            type: string
+                        required:
+                        - decision
+                        - name
+                        type: object
+                      type: array
+                    lastPatchTime:
+                      description: LastPatchTime is the last time this controller patched
+                        the target.
+                      format: date-time
                       type: string
-                    oldImage:
+                    patchAttempts:
+                      description: PatchAttempts lists the patch timestamps still inside
+                        the thrashing window.
+                      items:
+                        format: date-time
+                        type: string
+                      type: array
+                    phase:
+                      description: Phase is the overall outcome for this target.
                       type: string
-                    target:
-                      description: Target is a target for image replacement
+                    reason:
+                      description: Reason optionally explains the phase.
+                      type: string
+                    rollout:
+                      description: Rollout reports rollout progress for workload kinds
+                        that support it.
                       properties:
-                        container:
-                          description: Container is the container that matches our
-                            list
+                        desiredReplicas:
+                          description: DesiredReplicas is the number of replicas the
+                            workload is configured to run.
+                          format: int32
+                          type: integer
+                        generation:
+                          description: Generation is the metadata.generation of the
+                            workload after the template patch.
+                          format: int64
+                          type: integer
+                        manual:
+                          description: Manual is true when the workload update strategy
+                            does not roll pods automatically (e.g. a StatefulSet using
+                            the OnDelete strategy).
+                          type: boolean
+                        observedGeneration:
+                          description: ObservedGeneration is the generation the workload
+                            controller reports having processed.
+                          format: int64
+                          type: integer
+                        updatedReplicas:
+                          description: UpdatedReplicas is the number of replicas currently
+                            running the updated template.
+                          format: int32
+                          type: integer
+                      required:
+                      - desiredReplicas
+                      - generation
+                      - observedGeneration
+                      - updatedReplicas
+                      type: object
+                    target:
+                      description: Target identifies the workload or standalone pod.
+                      properties:
+                        group:
+                          type: string
+                        kind:
                           type: string
                         name:
                           type: string
-                        type:
-                          description: GroupKind specifies a Group and a Kind, but
-                            does not force a version.  This is useful for identifying
-                            concepts during lookup stages without having partially
-                            valid types
-                          properties:
-                            group:
-                              type: string
-                            kind:
-                              type: string
-                          required:
-                          - group
-                          - kind
-                          type: object
+                        namespace:
+                          type: string
                         uid:
-                          description: UID is a type that holds unique ID values,
-                            including UUIDs.  Because we don't ONLY use UUIDs, this
-                            is an alias to string.  Being a type captures intent and
-                            helps make sure that UIDs and names do not get conflated.
+                          description: UID is a type that holds unique ID values, including
+                            UUIDs. Because we don't ONLY use UUIDs, this is an alias
+                            to string. Being a type captures intent and helps make sure
+                            that UIDs and names do not get conflated.
                           type: string
                       required:
+                      - group
+                      - kind
                       - name
-                      - type
+                      - namespace
                       type: object
-                    time:
-                      format: date-time
-                      type: string
                   required:
-                  - newImage
-                  - oldImage
+                  - phase
                   - target
-                  - time
                   type: object
                 type: array
             required:
