@@ -1,0 +1,7 @@
+domain: fairwinds.com
+repo: github.com/fairwindsops/saffire
+resources:
+- group: saffire
+  kind: AlternateImageSource
+  version: v1alpha1
+version: "2"

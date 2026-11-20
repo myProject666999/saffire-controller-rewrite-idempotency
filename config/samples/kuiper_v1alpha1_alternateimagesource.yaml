@@ -1,0 +1,9 @@
+apiVersion: saffire.fairwinds.com/v1alpha1
+kind: AlternateImageSource
+metadata:
+  name: alternateimagesource-sample
+spec:
+  imageSourceReplacements:
+    - equivalentRepositories:
+        - quay.io/fairwinds/docker-demo
+        - ehazlett/docker-demo
